@@ -18,11 +18,18 @@ This script handles that nonsense and saves each page as `.rtf` or `.docx`.
 - `requests`
 - `beautifulsoup4`
 - `python-docx` (only needed for DOCX output)
+- `playwright` (needed for browser-rendered fallback on JS-heavy sites)
 
 Install dependencies:
 
 ```bash
-python3 -m pip install requests beautifulsoup4 python-docx
+python3 -m pip install -r requirements.txt
+```
+
+Install browser engine once (for Playwright mode):
+
+```bash
+python3 -m playwright install chromium
 ```
 
 ## Run It
@@ -52,16 +59,25 @@ You will be prompted for:
 4. **Main-content-only mode (yes/no)**
    - `yes`: tries to focus on actual page content and skip template noise
    - `no`: grabs broader page text, including more surrounding fluff
+   - Default is `no` because site structures vary and auto-detection can miss content
 
 5. **Optional main-content CSS selector**
    - Leave blank to auto-detect
    - Example selectors: `main`, `article`, `#content`, `.entry-content`
    - Useful when a site has a weird layout and auto-detection picks garbage
 
-6. **Output format**
+6. **Render mode**
+   - `auto`: requests first, then browser fallback when content is too thin
+   - `requests`: requests-only (fastest)
+   - `browser`: always use Playwright-rendered DOM (best for JS-heavy sites)
+
+7. **Auto fallback min chars**
+   - In `auto` mode, if extracted text is shorter than this, browser fallback is attempted
+
+8. **Output format**
    - `rtf` or `docx`
 
-7. **Combine pages into one domain document (yes/no)**
+9. **Combine pages into one domain document (yes/no)**
    - `yes`: saves one file like `all_pages.rtf` or `all_pages.docx`
    - `no`: saves one file per scraped page
 
@@ -76,6 +92,8 @@ python3 scraper.py \
   --sitemap "https://example.com/sitemap.xml" \
   --max-pages 10 \
   --delay 1.0 \
+  --render-mode auto \
+  --fallback-min-chars 300 \
   --main-content-only yes \
   --main-selector ".entry-content" \
   --format docx \
@@ -87,11 +105,41 @@ Flags:
 - `--sitemap` domain/base URL or full sitemap URL
 - `--max-pages` max pages to save (`0` = unlimited)
 - `--delay` seconds between requests
+- `--render-mode` `auto`, `requests`, or `browser`
+- `--fallback-min-chars` browser fallback threshold in `auto` mode
 - `--main-content-only` `yes` or `no`
 - `--main-selector` optional CSS selector for main-content extraction
 - `--format` `rtf` or `docx`
 - `--sub-sitemaps` comma-separated 1-based indexes from sitemap index (`all` if omitted)
 - `--combine-per-domain` combine all scraped pages into one file
+
+## Desktop MVP (macOS)
+
+Run the GUI:
+
+```bash
+python3 mvp_gui.py
+```
+
+The GUI supports:
+- domain/sitemap input
+- loading and selecting sub-sitemaps
+- max pages / delay / main-content options
+- optional CSS selector
+- output format (`rtf`/`docx`)
+- combine-per-domain toggle
+- live log output
+
+Package as an unsigned `.app` for internal testing:
+
+```bash
+pyinstaller --windowed --name "ContentScraperMVP" mvp_gui.py
+```
+
+Then share:
+- `dist/ContentScraperMVP.app`
+
+Heads-up: because this is unsigned, other users may need to right-click and choose Open the first time.
 
 ## Output Structure
 
@@ -111,6 +159,8 @@ scraped_pages/example.com/all_pages.docx
 ```
 
 Filenames are sanitized to stay filesystem-safe and include path/query cues to reduce collisions.
+
+Saved document content includes bold div-class labels (when available) to make sections easier to scan.
 
 ## Notes Before You Do Dumb Stuff
 

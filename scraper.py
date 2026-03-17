@@ -17,9 +17,12 @@ NON_HTML_EXTENSIONS = {
 }
 MAX_SCRAPED_PAGES_TEST = 10
 REQUEST_DELAY_SECONDS = 1.0
-MAIN_CONTENT_ONLY_DEFAULT = True
+MAIN_CONTENT_ONLY_DEFAULT = False
 OUTPUT_FORMAT_DEFAULT = "rtf"
 COMBINE_PER_DOMAIN_DEFAULT = False
+DIV_CLASS_MARKER_PREFIX = "[[DIV_CLASS:"
+RENDER_MODE_DEFAULT = "auto"
+BROWSER_FALLBACK_MIN_TEXT_CHARS_DEFAULT = 300
 
 def get_sitemap_urls(sitemap_url, visited_sitemaps=None):
     """Fetches sitemap URLs, including sitemap index files (Yoast/WordPress)."""
@@ -169,8 +172,64 @@ def get_content_container(soup, main_content_only):
     return soup.body if soup.body else soup
 
 
-def scrape_page_text(url, main_content_only=True, main_content_selector=None):
-    """Scrapes the main text content from a URL, stripping out noise."""
+def _build_div_annotated_text(content_root):
+    """Builds text with class-labeled div sections for richer document output."""
+    sections = []
+    seen_snippets = set()
+
+    for div in content_root.find_all("div"):
+        classes = div.get("class") or []
+        if not classes:
+            continue
+
+        div_text = div.get_text(separator="\n", strip=True)
+        if len(div_text) < 40:
+            continue
+
+        snippet_key = div_text[:200]
+        if snippet_key in seen_snippets:
+            continue
+        seen_snippets.add(snippet_key)
+
+        class_label = "." + ".".join(classes)
+        sections.append((class_label, div_text))
+        if len(sections) >= 80:
+            break
+
+    if not sections:
+        return content_root.get_text(separator="\n", strip=True)
+
+    blocks = []
+    for class_label, div_text in sections:
+        blocks.append(f"{DIV_CLASS_MARKER_PREFIX}{class_label}]]")
+        blocks.append(div_text)
+    return "\n\n".join(blocks)
+
+
+def _extract_text_from_html(html_content, main_content_only=True, main_content_selector=None):
+    """Extracts cleaned and annotated text from HTML content."""
+    soup = BeautifulSoup(html_content, 'html.parser')
+
+    content_root = None
+    if main_content_only and main_content_selector:
+        content_root = soup.select_one(main_content_selector)
+        if content_root is None:
+            print(
+                f"Main selector '{main_content_selector}' not found on page; "
+                "falling back to auto-detection."
+            )
+    if content_root is None:
+        content_root = get_content_container(soup, main_content_only)
+
+    # Remove noisy layout elements from whichever container is selected.
+    for element in content_root(["script", "style", "nav", "footer", "header", "aside"]):
+        element.decompose()
+
+    return _build_div_annotated_text(content_root)
+
+
+def scrape_page_text_requests(url, main_content_only=True, main_content_selector=None):
+    """Scrapes a page using requests (fast path)."""
     try:
         headers = {'User-Agent': 'Mozilla/5.0'}
         response = requests.get(url, headers=headers)
@@ -179,38 +238,120 @@ def scrape_page_text(url, main_content_only=True, main_content_selector=None):
         if "html" not in content_type:
             print(f"Skipping non-HTML response ({content_type or 'unknown'}): {url}")
             return "", "skipped_content_type"
-        soup = BeautifulSoup(response.content, 'html.parser')
-
-        content_root = None
-        if main_content_only and main_content_selector:
-            content_root = soup.select_one(main_content_selector)
-            if content_root is None:
-                print(
-                    f"Main selector '{main_content_selector}' not found on page; "
-                    "falling back to auto-detection."
-                )
-        if content_root is None:
-            content_root = get_content_container(soup, main_content_only)
-
-        # Remove noisy layout elements from whichever container is selected.
-        for element in content_root(["script", "style", "nav", "footer", "header", "aside"]):
-            element.decompose()
-            
-        text = content_root.get_text(separator='\n', strip=True)
+        text = _extract_text_from_html(
+            response.content,
+            main_content_only=main_content_only,
+            main_content_selector=main_content_selector,
+        )
         return text, "ok"
     except Exception as e:
-        print(f"Error scraping {url}: {e}")
+        print(f"Error scraping (requests) {url}: {e}")
         return "", "error"
+
+
+def scrape_page_text_browser(url, main_content_only=True, main_content_selector=None):
+    """Scrapes a page using Playwright-rendered HTML (JS-enabled fallback)."""
+    try:
+        playwright_module = importlib.import_module("playwright.sync_api")
+    except ImportError as e:
+        print(
+            "Playwright is not installed. Install with: "
+            "python3 -m pip install playwright && python3 -m playwright install chromium"
+        )
+        return "", "browser_unavailable"
+
+    try:
+        with playwright_module.sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+            page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            if main_content_only and main_content_selector:
+                try:
+                    page.wait_for_selector(main_content_selector, timeout=5000)
+                except Exception:
+                    pass
+            else:
+                # Give JS apps a brief chance to render content.
+                page.wait_for_timeout(1500)
+            html = page.content()
+            browser.close()
+        text = _extract_text_from_html(
+            html,
+            main_content_only=main_content_only,
+            main_content_selector=main_content_selector,
+        )
+        if not text.strip():
+            return "", "empty"
+        return text, "ok"
+    except Exception as e:
+        print(f"Error scraping (browser) {url}: {e}")
+        return "", "error"
+
+
+def scrape_page_text(
+    url,
+    main_content_only=True,
+    main_content_selector=None,
+    render_mode=RENDER_MODE_DEFAULT,
+    browser_fallback_min_text_chars=BROWSER_FALLBACK_MIN_TEXT_CHARS_DEFAULT,
+):
+    """Scrapes page text using requests, browser rendering, or hybrid auto mode."""
+    mode = (render_mode or RENDER_MODE_DEFAULT).lower()
+    if mode == "requests":
+        return scrape_page_text_requests(
+            url,
+            main_content_only=main_content_only,
+            main_content_selector=main_content_selector,
+        )
+    if mode == "browser":
+        return scrape_page_text_browser(
+            url,
+            main_content_only=main_content_only,
+            main_content_selector=main_content_selector,
+        )
+
+    text, status = scrape_page_text_requests(
+        url,
+        main_content_only=main_content_only,
+        main_content_selector=main_content_selector,
+    )
+    if status != "ok":
+        return text, status
+    if len(text.strip()) >= browser_fallback_min_text_chars:
+        return text, "ok"
+
+    print(
+        f"Requests extraction looked thin ({len(text.strip())} chars); "
+        "trying browser-rendered fallback."
+    )
+    browser_text, browser_status = scrape_page_text_browser(
+        url,
+        main_content_only=main_content_only,
+        main_content_selector=main_content_selector,
+    )
+    if browser_status == "ok" and len(browser_text.strip()) > len(text.strip()):
+        return browser_text, "ok"
+    return text, "ok"
+
+def _escape_rtf_text(text):
+    return text.replace('\\', '\\\\').replace('{', '\\{').replace('}', '\\}')
+
 
 def save_as_rtf(text, filename):
     """Saves plain text into a basic RTF format."""
-    # Basic escaping required for the RTF format
-    text = text.replace('\\', '\\\\').replace('{', '\\{').replace('}', '\\}')
-    text = text.replace('\n', '\\par\n')
-    
-    # RTF Header and body
+    lines = text.splitlines()
+    rtf_body_parts = []
+    for raw_line in lines:
+        line = raw_line.strip()
+        if line.startswith(DIV_CLASS_MARKER_PREFIX) and line.endswith("]]"):
+            class_name = line[len(DIV_CLASS_MARKER_PREFIX):-2].strip()
+            rtf_body_parts.append(r"\b " + _escape_rtf_text(class_name) + r"\b0\par")
+        else:
+            rtf_body_parts.append(_escape_rtf_text(raw_line) + r"\par")
+
+    # RTF header and body
     rtf_content = r"{\rtf1\ansi\ansicpg1252\deff0{\fonttbl{\f0\fnil\fcharset0 Calibri;}}\f0\fs24 "
-    rtf_content += text + r"}"
+    rtf_content += "\n".join(rtf_body_parts) + r"}"
     
     with open(filename, 'w', encoding='utf-8') as f:
         f.write(rtf_content)
@@ -227,8 +368,15 @@ def save_as_docx(text, filename):
         ) from e
 
     document = docx_module.Document()
-    for paragraph in text.split("\n"):
-        document.add_paragraph(paragraph)
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if line.startswith(DIV_CLASS_MARKER_PREFIX) and line.endswith("]]"):
+            class_name = line[len(DIV_CLASS_MARKER_PREFIX):-2].strip()
+            paragraph = document.add_paragraph()
+            run = paragraph.add_run(class_name)
+            run.bold = True
+        else:
+            document.add_paragraph(raw_line)
     document.save(filename)
 
 
@@ -263,6 +411,8 @@ def main(
     combine_per_domain=COMBINE_PER_DOMAIN_DEFAULT,
     urls_override=None,
     main_content_selector=None,
+    render_mode=RENDER_MODE_DEFAULT,
+    browser_fallback_min_text_chars=BROWSER_FALLBACK_MIN_TEXT_CHARS_DEFAULT,
 ):
     """Main execution function."""
     domain_dir = os.path.join(output_dir, safe_domain_name(sitemap_url))
@@ -288,6 +438,9 @@ def main(
     print(f"Main-content-only mode: {'on' if main_content_only else 'off'}")
     if main_content_only and main_content_selector:
         print(f"Main-content CSS selector: {main_content_selector}")
+    print(f"Render mode: {render_mode}")
+    if render_mode == "auto":
+        print(f"Browser fallback threshold: {browser_fallback_min_text_chars} chars")
     print(f"Output format: {output_format}")
     print(f"Combine into single domain document: {'yes' if combine_per_domain else 'no'}")
 
@@ -314,6 +467,8 @@ def main(
             url,
             main_content_only=main_content_only,
             main_content_selector=main_content_selector,
+            render_mode=render_mode,
+            browser_fallback_min_text_chars=browser_fallback_min_text_chars,
         )
         if request_delay_seconds > 0:
             time.sleep(request_delay_seconds)
@@ -462,6 +617,16 @@ def parse_cli_args():
             "(example: 1,3,5). If omitted, prompts interactively."
         ),
     )
+    parser.add_argument(
+        "--render-mode",
+        choices=["auto", "requests", "browser"],
+        help="Render strategy: auto (requests with browser fallback), requests, or browser.",
+    )
+    parser.add_argument(
+        "--fallback-min-chars",
+        type=int,
+        help="In auto mode, retry with browser render when requests text is shorter than this.",
+    )
     return parser.parse_args()
 
 
@@ -548,6 +713,24 @@ if __name__ == "__main__":
             print(f"Invalid --delay '{delay_seconds}'. Falling back to default.")
             delay_seconds = REQUEST_DELAY_SECONDS
 
+        render_mode = args.render_mode or prompt_choice_with_default(
+            "Render mode",
+            ["auto", "requests", "browser"],
+            RENDER_MODE_DEFAULT,
+        )
+        fallback_min_chars = (
+            args.fallback_min_chars
+            if args.fallback_min_chars is not None
+            else prompt_int_with_default(
+                "Auto mode browser fallback threshold (min chars)",
+                BROWSER_FALLBACK_MIN_TEXT_CHARS_DEFAULT,
+                min_value=0,
+            )
+        )
+        if fallback_min_chars < 0:
+            print(f"Invalid --fallback-min-chars '{fallback_min_chars}'. Using default.")
+            fallback_min_chars = BROWSER_FALLBACK_MIN_TEXT_CHARS_DEFAULT
+
         if args.main_content_only is None:
             main_only = prompt_yes_no_with_default(
                 "Try to extract only main page content (exclude header/footer/nav)",
@@ -603,6 +786,8 @@ if __name__ == "__main__":
                 combine_per_domain=combine_per_domain,
                 urls_override=selected_urls,
                 main_content_selector=main_selector,
+                render_mode=render_mode,
+                browser_fallback_min_text_chars=fallback_min_chars,
             )
         else:
             main(
@@ -613,6 +798,8 @@ if __name__ == "__main__":
                 output_format=output_format,
                 combine_per_domain=combine_per_domain,
                 main_content_selector=main_selector,
+                render_mode=render_mode,
+                browser_fallback_min_text_chars=fallback_min_chars,
             )
     except ValueError as e:
         print(f"Input error: {e}")

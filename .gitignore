@@ -24,3 +24,8 @@ env/
 
 # Generated scraper output
 scraped_pages/
+
+# Local app packaging artifacts
+build/
+dist/
+*.spec
